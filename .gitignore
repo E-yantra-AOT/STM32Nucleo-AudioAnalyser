@@ -1,0 +1,34 @@
+# -----------------------------
+# Python PC Script
+# -----------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+env/
+venv/
+.venv/
+
+# -----------------------------
+# STM32CubeIDE / C Build Outputs
+# -----------------------------
+Debug/
+Release/
+*.o
+*.d
+*.su
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.log
+
+# -----------------------------
+# IDE & OS Specific
+# -----------------------------
+.metadata/
+.vscode/
+.DS_Store
+Thumbs.db
