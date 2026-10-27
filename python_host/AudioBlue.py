@@ -1,89 +1,132 @@
-import sounddevice as sd  # Captures audio from the microphone
-import serial             # Handles UART communication over USB
-import numpy as np        # Used for fast array math and type conversion
-import queue              # Thread-safe queue to pass data between threads
-import sys                # System-level commands (like exiting on error)
+import sys
+import struct
+import threading
+import queue
+import serial
+import numpy as np
+import sounddevice as sd
+import pyqtgraph as pg
+from PyQt6.QtWidgets import QApplication
 
 # ---------------------------------------------------------
-# 1. AUDIO DEVICE SELECTION
-# Print all available audio inputs to the terminal so the 
-# user can identify the correct microphone ID.
+# CONFIGURATION
 # ---------------------------------------------------------
+SERIAL_PORT = 'COM10'
+BAUD_RATE = 460800
+SAMPLE_RATE = 16000
+BLOCK_SIZE = 512
+
 print("\n--- AVAILABLE AUDIO DEVICES ---")
 print(sd.query_devices())
-print("-------------------------------\n")
-
 try:
-    # Prompt the user to type the ID of the microphone they want to stream
-    mic_id_input = input("Enter the ID number of your Nord Buds Microphone: ")
-    MIC_ID = int(mic_id_input)
+    MIC_ID = int(input("Enter the ID number of your Microphone: "))
 except ValueError:
-    print("Invalid ID. Exiting.")
     sys.exit(1)
 
-# ---------------------------------------------------------
-# 2. HARDWARE CONFIGURATION
-# ---------------------------------------------------------
-SERIAL_PORT = 'COMx'       # MUST match the ST-LINK Virtual COM port in Device Manager
-BAUD_RATE   = 460800       # High-speed baud rate matching the STM32 USART2 configuration
-SAMPLE_RATE = 16000        # 16 kHz sample rate (standard for voice audio)
-BLOCK_SIZE  = 512          # Number of audio frames processed at a time
-
-# Create a thread-safe queue. This is critical because writing to a USB serial 
-# port is slow. The queue prevents the slow USB write from blocking the fast 
-# microphone capture, which avoids "Input Overflow" errors.
-audio_queue = queue.Queue()
-
-# ---------------------------------------------------------
-# 3. INITIALIZE SERIAL CONNECTION
-# ---------------------------------------------------------
 try:
-    # Open the serial port with a slight timeout to prevent infinite blocking
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+    # write_timeout prevents python from freezing if the STM32 isn't reading
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1, write_timeout=0.5)
 except Exception as e:
-    print(f"Failed to open {SERIAL_PORT}: {e}")
+    print(f"Failed to open port {SERIAL_PORT}: {e}")
     sys.exit(1)
 
+audio_tx_queue = queue.Queue()
+fft_rx_queue = queue.Queue()
+
 # ---------------------------------------------------------
-# 4. AUDIO CAPTURE CALLBACK
-# This function is automatically called by the sounddevice 
-# library in a background C-thread every time 'BLOCK_SIZE' 
-# audio frames are recorded. It must execute instantly.
+# THREAD 1: AUDIO CAPTURE & TX (PC -> STM32)
 # ---------------------------------------------------------
 def audio_callback(indata, frames, time, status):
-    # 'indata' comes in as float32 decimal values between -1.0 and 1.0.
-    # We multiply by 32767 to scale it, convert to 16-bit signed integers (PCM),
-    # and then convert the array into a raw binary string of bytes.
-    pcm16_data = (indata[:, 0] * 32767).astype(np.int16).tobytes()
-    
-    # Toss the raw bytes into the queue and exit instantly so the mic can keep recording
-    audio_queue.put(pcm16_data)
+    pcm16 = (indata[:, 0] * 32767).astype(np.int16).tobytes()
+    audio_tx_queue.put(pcm16)
+
+def tx_thread():
+    with sd.InputStream(device=MIC_ID, samplerate=SAMPLE_RATE, channels=1, dtype='float32', blocksize=BLOCK_SIZE, callback=audio_callback):
+        while True:
+            data = audio_tx_queue.get()
+            try:
+                ser.write(data)
+            except Exception:
+                pass
 
 # ---------------------------------------------------------
-# 5. MAIN EXECUTION LOOP
+# THREAD 2: SERIAL RX (STM32 -> PC)
 # ---------------------------------------------------------
-try:
-    print(f"\nStreaming Mic ID {MIC_ID} to STM32 on {SERIAL_PORT}...")
+def rx_thread():
+    sync_pattern = b'\xAA\xBB\xCC\xDD'
+    buffer = bytearray()
     
-    # Start the audio stream. This opens the microphone and spawns a background 
-    # thread that continuously feeds the 'audio_callback' function.
-    with sd.InputStream(device=MIC_ID, 
-                        samplerate=SAMPLE_RATE, 
-                        channels=1, 
-                        dtype='float32', 
-                        blocksize=BLOCK_SIZE, 
-                        callback=audio_callback):
-        
-        # This is the main thread. Its only job is to wait for data to appear 
-        # in the queue and blast it over the UART cable as fast as possible.
-        while True:
-            data_chunk = audio_queue.get()  # Block until data is available in the queue
-            ser.write(data_chunk)           # Send the binary chunk to the STM32
+    while True:
+        try:
+            # Pull everything currently sitting in the Windows USB buffer
+            buffer += ser.read(max(1, ser.in_waiting))
             
-except KeyboardInterrupt:
-    # Catch Ctrl+C to cleanly stop the stream without throwing an ugly error trace
-    print("\nStreaming stopped.")
-finally:
-    # Always ensure the serial port is closed on exit so it doesn't stay locked in Windows
-    if 'ser' in locals() and ser.is_open:
-        ser.close()
+            # Hunt for the 4-byte sync header sent by the STM32
+            if sync_pattern in buffer:
+                idx = buffer.find(sync_pattern)
+                
+                # Check if the full 256-byte payload has arrived yet (64 floats * 4 bytes)
+                if len(buffer) >= idx + 4 + 256:
+                    packet = buffer[idx+4 : idx+4+256]
+                    
+                    # Unpack raw binary into a Python tuple of 64 floats
+                    fft_data = struct.unpack('<64f', packet)
+                    
+                    # Clear queue to ensure we only graph the freshest frame
+                    while not fft_rx_queue.empty():
+                        try: fft_rx_queue.get_nowait()
+                        except: pass
+                        
+                    fft_rx_queue.put(fft_data)
+                    
+                    # Slice the buffer to remove the processed packet
+                    buffer = buffer[idx+4+256:]
+                else:
+                    # Drop old junk data before the sync pattern to save memory
+                    buffer = buffer[idx:]
+        except Exception:
+            pass
+
+# Start the background communication threads
+threading.Thread(target=tx_thread, daemon=True).start()
+threading.Thread(target=rx_thread, daemon=True).start()
+
+# ---------------------------------------------------------
+# MAIN THREAD: PYQTGRAPH GUI
+# ---------------------------------------------------------
+app = QApplication(sys.argv)
+win = pg.GraphicsLayoutWidget(show=True, title="STM32 Hardware Spectrum Analyzer")
+win.resize(1000, 600)
+
+plot = win.addPlot(title="Real-Time Frequency Spectrum (0 - 8 kHz)")
+plot.setYRange(0, 15000)   # Adjust this max height based on your mic sensitivity
+plot.setXRange(0, 8000)
+plot.setLabel('left', 'Linear Amplitude')
+plot.setLabel('bottom', 'Frequency', units='Hz')
+plot.showGrid(x=True, y=True, alpha=0.3)
+
+# Create 64 bins mapped to their exact center frequencies
+x_freqs = np.linspace(0, 8000, 64)
+bar_graph = pg.BarGraphItem(x=x_freqs, height=np.zeros(64), width=100, brush='c')
+plot.addItem(bar_graph)
+
+# GUI Update Loop (~30 FPS)
+def update_gui():
+    try:
+        # Grab the newest FFT array from the RX thread
+        new_fft_data = fft_rx_queue.get_nowait()
+        
+        # Overwrite the bars with the new heights
+        bar_graph.setOpts(height=new_fft_data)
+    except queue.Empty:
+        pass
+
+# Trigger the GUI update every 30 milliseconds
+from PyQt6.QtCore import QTimer
+timer = QTimer()
+timer.timeout.connect(update_gui)
+timer.start(30)
+
+if __name__ == '__main__':
+    # Reminder: Flash STM32 and hit Resume in debugger BEFORE running this!
+    sys.exit(app.exec())
