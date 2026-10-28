@@ -2,36 +2,35 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
+  * @brief          : Audio Spectrum Analyzer with CMSIS-DSP & Flash Optimization
   ******************************************************************************
   */
 /* USER CODE END Header */
+
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
-/* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdbool.h>
+#include <math.h>
+
+/* CMSIS-DSP Core Includes */
+#include "arm_math.h"
+#include "arm_const_structs.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef struct {
+    uint8_t buffer[4096];
+    volatile uint16_t head;
+    volatile uint16_t tail;
+} RingBuffer;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define AUDIO_BUFFER_SIZE 4096
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -43,64 +42,50 @@
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-#define AUDIO_BUFFER_SIZE 4096
-
-typedef struct {
-    uint8_t buffer[AUDIO_BUFFER_SIZE];
-    volatile uint16_t head;
-    volatile uint16_t tail;
-} RingBuffer;
-
 RingBuffer audio_fifo = { .head = 0, .tail = 0 };
-uint8_t dma_rx_buffer[128];
+uint8_t rx_data[1];
+uint8_t processing_buffer[256];
+
+/* DSP Variables */
+float32_t fft_magnitudes[64];
+float32_t max_fft_observed = 0.0f;
+float32_t lpf_prev_output = 0.0f;
+volatile uint32_t packet_counter = 0;
+
+/* Pre-calculated 128-point Hanning Window (Stored in Flash Memory) */
+const float32_t hanning_window_128[128] = {
+    0.00000000f, 0.00060888f, 0.00243431f, 0.00547025f, 0.00970724f, 0.01513221f, 0.02172828f, 0.02947470f,
+    0.03834661f, 0.04831518f, 0.05934759f, 0.07140723f, 0.08445371f, 0.09844309f, 0.11332884f, 0.12906282f,
+    0.14559527f, 0.16287582f, 0.18085353f, 0.19947703f, 0.21869460f, 0.23845426f, 0.25870381f, 0.27939103f,
+    0.30046380f, 0.32186991f, 0.34355716f, 0.36547343f, 0.38756667f, 0.40978496f, 0.43207641f, 0.45438927f,
+    0.47667205f, 0.49887352f, 0.52094285f, 0.54282967f, 0.56448416f, 0.58585695f, 0.60690022f, 0.62756672f,
+    0.64781079f, 0.66758763f, 0.68685361f, 0.70556637f, 0.72368481f, 0.74116899f, 0.75798031f, 0.77408162f,
+    0.78943734f, 0.80401344f, 0.81777757f, 0.83069905f, 0.84274900f, 0.85389988f, 0.86412595f, 0.87340333f,
+    0.88170997f, 0.88902564f, 0.89533190f, 0.90061226f, 0.90485124f, 0.90803522f, 0.91015243f, 0.91119299f,
+    0.91119299f, 0.91015243f, 0.90803522f, 0.90485124f, 0.90061226f, 0.89533190f, 0.88902564f, 0.88170997f,
+    0.87340333f, 0.86412595f, 0.85389988f, 0.84274900f, 0.83069905f, 0.81777757f, 0.80401344f, 0.78943734f,
+    0.77408162f, 0.75798031f, 0.74116899f, 0.72368481f, 0.70556637f, 0.68685361f, 0.66758763f, 0.64781079f,
+    0.62756672f, 0.60690022f, 0.58585695f, 0.56448416f, 0.54282967f, 0.52094285f, 0.49887352f, 0.47667205f,
+    0.45438927f, 0.43207641f, 0.40978496f, 0.38756667f, 0.36547343f, 0.34355716f, 0.32186991f, 0.30046380f,
+    0.27939103f, 0.25870381f, 0.23845426f, 0.21869460f, 0.19947703f, 0.18085353f, 0.16287582f, 0.14559527f,
+    0.12906282f, 0.11332884f, 0.09844309f, 0.08445371f, 0.07140723f, 0.05934759f, 0.04831518f, 0.03834661f,
+    0.02947470f, 0.02172828f, 0.01513221f, 0.00970724f, 0.00547025f, 0.00243431f, 0.00060888f, 0.00000000f
+};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
-/* USER CODE BEGIN PFP */
 
+/* USER CODE BEGIN PFP */
+void ring_buffer_push(uint8_t data);
+void ring_buffer_pop(uint8_t *dest, uint16_t length);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void ring_buffer_push(const uint8_t *data, uint16_t length) {
-    uint16_t i;
-    for (i = 0; i < length; i++) {
-        uint16_t next_head = (audio_fifo.head + 1) % AUDIO_BUFFER_SIZE;
-        if (next_head != audio_fifo.tail) {
-            audio_fifo.buffer[audio_fifo.head] = data[i];
-            audio_fifo.head = next_head;
-        }
-    }
-}
 
-uint16_t ring_buffer_pop(uint8_t *out_data, uint16_t requested_length) {
-    uint16_t count = 0;
-    while (count < requested_length && audio_fifo.head != audio_fifo.tail) {
-        out_data[count] = audio_fifo.buffer[audio_fifo.tail];
-        audio_fifo.tail = (audio_fifo.tail + 1) % AUDIO_BUFFER_SIZE;
-        count++;
-    }
-    return count;
-}
-
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-    if (huart->Instance == USART2) {
-        static uint16_t packet_counter = 0;
-        packet_counter++;
-
-        /* Toggle the Green LED on the Nucleo board every 10 packets */
-        if (packet_counter >= 250) {
-            HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-            packet_counter = 0;
-        }
-
-        ring_buffer_push(dma_rx_buffer, sizeof(dma_rx_buffer));
-        HAL_UART_Receive_IT(&huart2, dma_rx_buffer, sizeof(dma_rx_buffer));
-    }
-}
 /* USER CODE END 0 */
 
 /**
@@ -109,7 +94,6 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
   */
 int main(void)
 {
-
   /* USER CODE BEGIN 1 */
 
   /* USER CODE END 1 */
@@ -133,14 +117,71 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART2_UART_Init();
+
   /* USER CODE BEGIN 2 */
-  HAL_UART_Receive_IT(&huart2, dma_rx_buffer, sizeof(dma_rx_buffer));
+  /* Prime the UART to receive the first byte via Interrupt */
+  HAL_UART_Receive_IT(&huart2, rx_data, 1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+      /* Calculate available unread bytes in the ring buffer */
+      uint16_t data_available = (audio_fifo.head >= audio_fifo.tail) ?
+                                (audio_fifo.head - audio_fifo.tail) :
+                                (AUDIO_BUFFER_SIZE - audio_fifo.tail + audio_fifo.head);
+
+      /* Wait until a full 128-sample frame (256 bytes) is ready */
+      if (data_available >= 256) {
+          ring_buffer_pop(processing_buffer, 256);
+
+          /* CMSIS-DSP interleaved buffer: [Real, Imag, Real, Imag...] */
+          float32_t fft_buffer[256];
+          int sample_index = 0;
+
+          /* Low-Pass Filter configuration (alpha = 0.28 sets cutoff fc ~ 1 kHz) */
+          const float32_t alpha = 0.28f;
+
+          for (int i = 0; i < 256; i += 2) {
+              /* 1. Reconstruct 16-bit PCM integer (Little-Endian) */
+              int16_t raw_pcm = (int16_t)((processing_buffer[i+1] << 8) | processing_buffer[i]);
+
+              /* 2. Apply Single-Pole IIR Low-Pass Filter */
+              float32_t filtered_sample = (alpha * (float32_t)raw_pcm) + ((1.0f - alpha) * lpf_prev_output);
+              lpf_prev_output = filtered_sample;
+
+              /* 3. Windowing (Flash Lookup) */
+              /* Multiply the filtered sample by the pre-calculated Hanning array */
+              fft_buffer[sample_index * 2] = filtered_sample * hanning_window_128[sample_index]; /* Real */
+              fft_buffer[(sample_index * 2) + 1] = 0.0f;                                         /* Imaginary */
+
+              sample_index++;
+          }
+
+          /* 4. Execute CMSIS-DSP 128-point Floating-Point FFT */
+          arm_cfft_f32(&arm_cfft_sR_f32_len128, fft_buffer, 0, 1);
+
+          /* 5. Extract Complex Magnitudes natively */
+          float32_t raw_magnitudes[64];
+          arm_cmplx_mag_f32(fft_buffer, raw_magnitudes, 64);
+
+          /* 6. Normalize */
+          for (int i = 0; i < 64; i++) {
+              /* Divide by N/2 (64) to scale array back to PCM16 range */
+              float32_t current_mag = raw_magnitudes[i] / 64.0f;
+              fft_magnitudes[i] = current_mag;
+
+              if (current_mag > max_fft_observed) {
+                  max_fft_observed = current_mag;
+              }
+          }
+
+          /* 7. Transmit FFT Data back to PC for Visualization */
+          uint8_t sync_header[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+          HAL_UART_Transmit(&huart2, sync_header, 4, 10);
+          HAL_UART_Transmit(&huart2, (uint8_t*)fft_magnitudes, sizeof(fft_magnitudes), 50);
+      }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -227,9 +268,6 @@ static void MX_USART2_UART_Init(void)
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-
-  /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
@@ -257,28 +295,56 @@ static void MX_GPIO_Init(void)
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+void ring_buffer_push(uint8_t data) {
+    uint16_t next_head = (audio_fifo.head + 1) % AUDIO_BUFFER_SIZE;
+    if (next_head != audio_fifo.tail) {
+        audio_fifo.buffer[audio_fifo.head] = data;
+        audio_fifo.head = next_head;
+    }
+}
+
+void ring_buffer_pop(uint8_t *dest, uint16_t length) {
+    for (uint16_t i = 0; i < length; i++) {
+        dest[i] = audio_fifo.buffer[audio_fifo.tail];
+        audio_fifo.tail = (audio_fifo.tail + 1) % AUDIO_BUFFER_SIZE;
+    }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2)
+    {
+        ring_buffer_push(rx_data[0]);
+
+        packet_counter++;
+        /* Toggle LED to confirm data ingestion */
+        if (packet_counter >= 250) {
+            HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+            packet_counter = 0;
+        }
+
+        /* Re-prime the interrupt for the next byte */
+        HAL_UART_Receive_IT(&huart2, rx_data, 1);
+    }
+}
+
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART2)
     {
-        /* 1. Clear physical hardware flags (Overrun, Framing, Noise) */
+        /* Clear UART Overrun (ORE) flags manually if data arrives too fast */
         volatile uint32_t tmpreg = 0x00U;
-        tmpreg = huart->Instance->SR;  /* Read Status Register */
-        tmpreg = huart->Instance->DR;  /* Read Data Register */
-        (void)tmpreg;                  /* Prevent compiler warnings */
+        tmpreg = huart->Instance->SR;
+        tmpreg = huart->Instance->DR;
+        (void)tmpreg;
 
-        /* 2. Reset HAL internal software state */
         huart->ErrorCode = HAL_UART_ERROR_NONE;
         huart->RxState = HAL_UART_STATE_READY;
 
-        /* 3. Re-arm the receiver */
-        HAL_UART_Receive_IT(&huart2, dma_rx_buffer, sizeof(dma_rx_buffer));
+        HAL_UART_Receive_IT(&huart2, rx_data, 1);
     }
 }
 /* USER CODE END 4 */
@@ -290,14 +356,14 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
   }
   /* USER CODE END Error_Handler_Debug */
 }
-#ifdef USE_FULL_ASSERT
+
+#ifdef  USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
   *         where the assert_param error has occurred.
@@ -308,8 +374,6 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: fil+e %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
