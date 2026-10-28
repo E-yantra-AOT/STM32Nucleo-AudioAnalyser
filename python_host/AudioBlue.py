@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import QApplication
 # ---------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------
-SERIAL_PORT = 'COM10'
+SERIAL_PORT = 'COMx'
 BAUD_RATE = 460800
 SAMPLE_RATE = 16000
 BLOCK_SIZE = 512
