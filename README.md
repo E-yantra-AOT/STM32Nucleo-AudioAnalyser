@@ -1,16 +1,18 @@
 # STM32-AudioAnalyser
 
-A robust, real-time data pipeline that captures live microphone audio from a PC, converts it into a continuous 16-bit PCM stream, and transmits it via high-speed UART to an STM32 microcontroller.
+A robust, real-time embedded DSP pipeline that captures live microphone audio from a PC, streams it as 16-bit PCM data over high-speed UART to an STM32 Nucleo-F103RB, and performs on-chip digital filtering and 128-point FFT spectrum analysis.
 
-This project serves as the foundational hardware bridge for embedded Digital Signal Processing (DSP). It bypasses the need for external analog pre-amplifier circuits by utilizing the PC's sound card as the ADC, funneling digitized, noise-free audio directly into the STM32's memory for real-time manipulation.
+This project bypasses external analog pre-amplifier circuitry by utilizing the PC's sound card as the ADC, funneling digitized audio into the STM32's circular buffer for real-time Exponential Moving Average (EMA) low-pass filtering, Hanning windowing, and frequency-domain extraction.
 
 ## 🚀 Current Features
 
 - **Live Audio Capture:** Uses Python to grab real-time audio from any PC-connected microphone (analog or Bluetooth).
 - **High-Speed Serial Streaming:** Transmits 16-bit PCM data over a Virtual COM Port at 460,800 baud.
-- **Non-Blocking Architecture:** Thread-safe queueing on the Python host ensures the microphone never drops frames while waiting for USB serial writes.
+- **Non-Blocking Architecture:** Thread-safe queueing and serial write timeouts (`write_timeout=0.5`) on the Python host ensure the microphone never drops frames or locks the OS kernel if the MCU is paused.
 - **Interrupt-Driven Ring Buffer:** The STM32 utilizes an asynchronous circular buffer (4096 bytes) to catch continuous audio data without halting the main CPU loop.
 - **Bulletproof Error Recovery:** Custom hardware-level register resets prevent the STM32 from freezing during Overrun (ORE) or Framing errors caused by heavy interrupt loads.
+- **1st-Order IIR Low-Pass Filter:** Implements a single-pole Exponential Moving Average (EMA) digital filter ($\alpha = 0.28$, $f_c \approx 1\text{ kHz}$) to strip high-frequency ambient noise and sibilance before spectral analysis.
+- **On-Chip 128-Point Radix-2 FFT:** Applies a Hanning window to 128-sample blocks and computes an in-place Cooley-Tukey FFT with $N/2$ linear amplitude normalization ($125\text{ Hz}$ bin resolution, $\sim 8.5\text{ ms}$ total latency).
 
 ## 🛠️ Tools & Hardware Required
 
@@ -22,22 +24,23 @@ This project serves as the foundational hardware bridge for embedded Digital Sig
 
 ### Software
 
-- **IDE:** [STM32CubeIDE](https://www.st.com/en/development-tools/stm32cubeide.html)
+- **Hardware Configuration:** [STM32CubeMX](https://www.st.com/en/development-tools/stm32cubemx.html) (Standalone)
+- **IDE & Toolchain:** [STM32CubeIDE 2.0+](https://www.st.com/en/development-tools/stm32cubeide.html)
 - **Environment:** Python 3.8+
 - **Python Libraries:** `sounddevice`, `pyserial`, `numpy`
 
 ## 📂 Repository Structure
 
 ```text
-nord-buds-stm32-bridge/
+STM32Nucleo-AudioAnalyser/
 ├── python_host/
-│   ├── AudioBlue.py            # Main audio capture and UART streaming script
-│   └── requirements.txt        # Python dependencies
+│   └── AudioBlue.py                # Main audio capture and UART streaming script
 ├── stm32_firmware/
-│   ├── Core/                   # Main C application code (main.c, ring buffer, callbacks)
-│   ├── Drivers/                # STM32 HAL and CMSIS drivers
-│   ├── AudioSignalAnalyser.ioc # STM32CubeMX configuration file
-│   └── .project                # STM32CubeIDE project files
+│   ├── Core/                       # Main C DSP pipeline (main.c, ring buffer, IIR filter, FFT)
+│   ├── Drivers/                    # STM32 HAL and CMSIS drivers
+│   ├── AudioSIgnalAnalyser.ioc     # Standalone STM32CubeMX configuration file
+│   └── .project / .cproject        # STM32CubeIDE project files
+├── requirements.txt                # Python dependencies
 ├── .gitignore
 └── README.md
 ```
@@ -54,7 +57,7 @@ nord-buds-stm32-bridge/
    - The firmware is already configured to use USART2 with global interrupts enabled.
 6. Build the project using the **Hammer Icon** to ensure there are no compilation errors.
 7. Connect the STM32 Nucleo-F103RB to your PC using the USB connection associated with the ST-LINK interface.
-8. Click **Run/Debug** using the Green Play Button to flash the firmware onto the STM32.
+8. Click **Debug** to flash the firmware onto the STM32, then press **Resume (`F8`)** so the CPU actively runs past `HAL_Init()` and arms the UART RX interrupt before starting the Python stream.
 
 ### 2. Python Host Setup
 
@@ -73,9 +76,9 @@ nord-buds-stm32-bridge/
    ```bash
    env\Scripts\activate
    ```
-5. Install the required Python dependencies:
+5. Install the required Python dependencies (from the root directory or using `..`):
    ```bash
-   pip install -r requirements.txt
+   pip install -r ../requirements.txt
    ```
 6. Open **Device Manager** on Windows.
 7. Locate the ST-LINK Virtual COM Port and note its COM port number.
@@ -131,6 +134,10 @@ The Python application will:
 5. Send the data to the STM32 through USART2.
 6. Allow the STM32 interrupt-driven receiver to process the incoming byte stream.
 7. Store the received bytes inside the STM32 ring buffer.
+8. Pop 256-byte chunks (128 samples) from the ring buffer and reconstruct Little-Endian 16-bit signed PCM integers.
+9. Filter each sample through the 1st-order IIR Low-Pass Filter ($\alpha = 0.28$, $f_c \approx 1\text{ kHz}$).
+10. Apply a 128-point Hanning window to suppress spectral leakage and execute the in-place Radix-2 Cooley-Tukey FFT.
+11. Normalize the complex magnitudes by $N/2$ ($64.0$) into `fft_magnitudes[64]` for real-time inspection.
 
 ## ✅ Verification
 
@@ -150,6 +157,14 @@ This confirms that the STM32 is:
 - Triggering UART interrupts.
 - Processing the received bytes.
 - Pushing the data into the ring buffer.
+
+**STM32CubeIDE — Live Expressions**
+
+While in a Debug session with the MCU running, open the **Live Expressions** tab and monitor:
+- `fft_magnitudes` (`float[64]`): Real-time normalized linear amplitudes across 64 frequency bins ($0\text{ Hz}$ to $7875\text{ Hz}$ in $125\text{ Hz}$ steps). Bins above index `[8]` ($>1\text{ kHz}$) remain heavily attenuated by the IIR filter.
+- `max_fft_observed` (`float`): Tracks the highest normalized peak amplitude observed (scaled to the $0\text{–}32,767$ PCM16 range).
+- `lpf_prev_output` (`float`): Current state of the 1st-order IIR low-pass filter.
+- `audio_fifo` (`RingBuffer`): Inspect `head` and `tail` pointers to verify zero-overflow synchronization.
 
 ## 🔄 Data Pipeline
 
@@ -189,7 +204,19 @@ UART Error Handling
 4096-Byte Ring Buffer
     │
     ▼
-Future DSP Processing
+256-Byte Block Pop & 16-Bit Little-Endian PCM Reconstruction
+    │
+    ▼
+1st-Order IIR Low-Pass Filter (alpha = 0.28, fc ≈ 1 kHz)
+    │
+    ▼
+128-Point Hanning Window
+    │
+    ▼
+128-Point Radix-2 Cooley-Tukey FFT & N/2 Normalization
+    │
+    ▼
+fft_magnitudes[64] (STM32CubeIDE Live Expressions)
 ```
 
 ## 🧠 Technical Deep Dive: The Overrun Trap
@@ -292,7 +319,7 @@ This prevents a temporary UART error from permanently stopping the audio recepti
 
 ## 🔁 Interrupt-Driven Ring Buffer
 
-The STM32 uses a 4096-byte circular/ring buffer to decouple UART reception from future DSP processing.
+The STM32 uses a 4096-byte circular/ring buffer to decouple UART reception from main-loop DSP processing.
 
 Instead of forcing the main application to process every byte immediately:
 
@@ -339,15 +366,18 @@ This allows the buffer to operate continuously without moving the entire content
 
 The current system streams audio as:
 
-| Parameter   | Value      |
-|-------------|------------|
-| Sample Rate | 16 kHz     |
-| Sample Size | 16-bit     |
-| Format      | PCM        |
-| Channels    | Depends on host configuration |
-| Transport   | UART       |
-| Baud Rate   | 460800 baud |
-| Buffer      | 4096 bytes |
+| Parameter          | Value                         |
+|--------------------|-------------------------------|
+| Sample Rate ($f_s$)| 16 kHz                        |
+| Sample Size        | 16-bit Signed Little-Endian   |
+| Format             | PCM                           |
+| Channels           | 1 (Mono)                      |
+| Transport          | UART (460,800 baud)           |
+| Ring Buffer        | 4096 bytes                    |
+| Filter Topology    | 1st-Order IIR / EMA ($\alpha = 0.28$, $f_c \approx 1\text{ kHz}$) |
+| FFT Length ($N$)   | 128-Point Radix-2 (Hanning Windowed) |
+| Bin Resolution ($\Delta f$) | 125 Hz / bin (64 positive bins, $0\text{–}8\text{ kHz}$) |
+| Algorithmic Latency| ~8.5 – 9 ms (8 ms buffer + <0.5 ms compute @ 64 MHz) |
 
 For mono 16-bit audio:
 
@@ -445,27 +475,27 @@ DSP
 
 ### Phase 2 — PCM Reconstruction
 
-- [ ] Reconstruct the incoming 8-bit UART byte stream into 16-bit integers on the STM32.
-- [ ] Correctly handle little-endian sample ordering.
-- [ ] Verify reconstructed samples against the original Python samples.
-- [ ] Implement sample-level buffering.
+- [x] Reconstruct the incoming 8-bit UART byte stream into 16-bit integers on the STM32.
+- [x] Correctly handle little-endian sample ordering.
+- [x] Verify reconstructed samples against the original Python samples.
+- [x] Implement sample-level buffering (256-byte / 128-sample processing frames).
 
 ### Phase 3 — Digital Filtering
 
-- [ ] Implement an Exponential Moving Average (EMA) IIR Low-Pass Filter in C.
-- [ ] Remove high-frequency background noise.
-- [ ] Experiment with different smoothing coefficients.
-- [ ] Compare raw and filtered signals.
-- [ ] Measure processing latency.
+- [x] Implement an Exponential Moving Average (EMA) IIR Low-Pass Filter in C.
+- [x] Remove high-frequency background noise ($f_c \approx 1\text{ kHz}$).
+- [x] Calculate and tune smoothing coefficient ($\alpha = 0.28$).
+- [x] Compare raw and filtered signals in frequency domain.
+- [x] Measure processing latency (~8.5–9 ms total acoustic-to-spectrum delay).
 
-### Phase 4 — CMSIS-DSP Integration
+### Phase 4 — Frequency-Domain Analysis (FFT)
 
-- [ ] Integrate the CMSIS-DSP library.
-- [ ] Implement an FFT.
-- [ ] Perform real-time frequency analysis.
-- [ ] Generate frequency-domain data.
-- [ ] Identify dominant frequency components.
-- [ ] Investigate embedded spectrum visualization.
+- [x] Implement a 128-point Hanning window and in-place Radix-2 Cooley-Tukey FFT.
+- [x] Perform real-time frequency analysis ($125\text{ Hz}$ resolution across 64 bins).
+- [x] Generate $N/2$ normalized linear frequency-domain data (`fft_magnitudes`).
+- [x] Identify dominant frequency components (`max_fft_observed`).
+- [ ] Optional: Migrate custom C FFT to hardware-optimized CMSIS-DSP library.
+- [ ] Investigate embedded spectrum visualization (OLED display or Python serial plotter).
 
 ### Phase 5 — Embedded Audio Analyser
 
