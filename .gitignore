@@ -24,6 +24,7 @@ Release/
 *.map
 *.list
 *.log
+*.bak
 
 # -----------------------------
 # IDE & OS Specific
